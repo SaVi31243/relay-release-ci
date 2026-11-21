@@ -1,0 +1,17 @@
+name: relay-lab
+services:
+  relay:
+    image: ${RELAY_IMAGE:?Set RELAY_IMAGE}
+    environment:
+      PORT: "${RELAY_INTERNAL_PORT:-8080}"
+      RELAY_STATE_FILE: /opt/relay/release-profile.json
+    ports:
+      - "127.0.0.1:${RELAY_HOST_PORT:-8291}:${RELAY_INTERNAL_PORT:-8080}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/version', timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
