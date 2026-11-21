@@ -43,3 +43,8 @@ def test_invalid_revision_stops_startup(profile, monkeypatch, invalid):
     monkeypatch.setenv("RELAY_REVISION", invalid)
     with pytest.raises(ValueError, match="Invalid revision label"):
         create_service()
+
+
+def test_version_content_type(profile):
+    response = create_service().test_client().get("/version")
+    assert response.mimetype == "application/json"
