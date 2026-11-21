@@ -1,0 +1,137 @@
+name: Relay release checks
+run-name: Relay / ${{ github.event_name }} / ${{ github.head_ref || github.ref_name }}
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: Test Relay and build image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run API suite
+        run: |
+          mkdir -p evidence
+          python -m pip install -r requirements-test.txt 2>&1 | tee evidence/install.log
+          python -m pytest -q test_relay.py --junitxml=evidence/pytest.xml 2>&1 | tee evidence/pytest.log
+      - name: Build Docker image
+        run: |
+          docker build --build-arg "RELAY_REVISION=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "relay-lab:$GITHUB_SHA" . 2>&1 | tee evidence/build.log
+      - name: Package the verified build
+        if: github.event_name != 'pull_request'
+        run: docker save "relay-lab:$GITHUB_SHA" | gzip -1 > relay-image.tar.gz
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: qualification-logs
+          path: evidence/
+          retention-days: 7
+      - uses: actions/upload-artifact@v6
+        if: success() && github.event_name != 'pull_request'
+        with:
+          name: relay-image
+          path: relay-image.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  rollout:
+    name: Deploy Relay and verify HTTP
+    needs: verify
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.ref == 'refs/heads/experiment/assertion-failure' ||
+        github.ref == 'refs/heads/experiment/maintenance'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    concurrency:
+      group: relay-training-rollout
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install infrastructure test dependencies
+        run: |
+          mkdir -p evidence
+          python -m pip install -r requirements-test.txt 2>&1 | tee evidence/install.log
+      - uses: actions/download-artifact@v7
+        with:
+          name: relay-image
+      - name: Load candidate and find the last successful main release
+        id: previous
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker load -i relay-image.tar.gz 2>&1 | tee evidence/load.log
+          prior="$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml \
+            --branch main --event push --status success --limit 1 \
+            --json headSha --jq '.[].headSha')"
+          if [[ -z "$prior" && "$GITHUB_REF_NAME" == 'experiment/maintenance' ]]; then
+            echo 'Complete a successful main run before this experiment'
+            exit 1
+          fi
+          echo "sha=$prior" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Deploy, verify and restore if necessary
+        env:
+          PREVIOUS_SHA: ${{ steps.previous.outputs.sha }}
+        run: |
+          previous_image=""
+          if [[ -n "$PREVIOUS_SHA" ]]; then
+            previous_image="ghcr.io/${GITHUB_REPOSITORY,,}:$PREVIOUS_SHA"
+          fi
+          bash release.sh "relay-lab:$GITHUB_SHA" "$GITHUB_SHA" \
+            "$previous_image" "$PREVIOUS_SHA" 2>&1 | tee evidence/rollout.log
+      - name: Save remaining logs and stop Compose
+        if: always()
+        env:
+          RELAY_IMAGE: relay-lab:${{ github.sha }}
+        run: |
+          mkdir -p evidence
+          docker compose logs --no-color > evidence/final-container.log 2>&1 || true
+          docker compose down > evidence/cleanup.log 2>&1
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: rollout-evidence
+          path: evidence/
+          retention-days: 7
+      - name: Publish verified main image
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          published="ghcr.io/${GITHUB_REPOSITORY,,}:$GITHUB_SHA"
+          docker tag "relay-lab:$GITHUB_SHA" "$published"
+          docker push "$published"
