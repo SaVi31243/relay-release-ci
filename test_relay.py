@@ -16,7 +16,7 @@ def profile(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [("serving", 200), ("maintenance", 503)],
+    [("serving", 202), ("maintenance", 503)],
 )
 def test_health_response(profile, mode, expected):
     profile.write_text(json.dumps({"mode": mode}), encoding="utf-8")
